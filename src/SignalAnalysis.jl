@@ -847,7 +847,10 @@ windowed_line_length(x::AbstractVector{<:Real}, fs::Real;
                      normalize::Bool = false) =
     _sliding(seg -> line_length(seg; normalize = normalize), x, fs, win, overlap)
 
-    # Split x into overlapping windows and transform each. Segmenting is not an
+# =============================================================================
+# CONNECTIVITY
+# =============================================================================
+# Split x into overlapping windows and transform each. Segmenting is not an
 # optimisation here — it is what makes coherence DEFINED. With one segment the
 # numerator and denominator of coherence are algebraically equal and the answer
 # is 1.0 at every frequency regardless of the data.
