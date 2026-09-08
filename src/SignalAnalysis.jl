@@ -430,10 +430,19 @@ isolate_freq(x::AbstractVector{<:Real}, fs::Real, band::Symbol; kwargs...) =
 Total power in the band, in squared voltage units (µV²).
 
 WHY A²/2 AND NOT A². A sinusoid of amplitude A has mean square A²/2, because the
-average of cos² over a cycle is 1/2. Summing A_k²/2 across bins reproduces the
-signal's mean square exactly — that is Parseval, and it is the strongest single
-check on the whole package. DC and Nyquist are excluded from the halving because
-they are not oscillations: a constant of size A has mean square A².
+average of cos² over a cycle is 1/2. DC and Nyquist are excluded from the halving
+because they are not oscillations: a constant of size A has mean square A².
+
+PARSEVAL, AND WHEN IT HOLDS. With `window = :rect` and `detrend = false`,
+summing A_k²/2 across every bin reproduces `power(x)` exactly. That is the
+strongest single check on the package's scaling — but it holds ONLY for those
+settings. The default Hann window is scaled by coherent gain, which is correct
+for the AMPLITUDE of a tone but overcounts broadband POWER by
+mean(w²)/mean(w)² = 1.5, and spreads each tone across three bins whose A²/2
+values sum to 1.5× the true power. With `detrend = true` the DC bin is zero
+regardless of the signal's offset. So do not expect Σ band_power == power(x)
+under the defaults; use `:rect` when you need that identity, and treat Hann
+band powers as comparable to each other rather than to time-domain power.
 
 Band power scales with bandwidth, so comparing a 0.5 Hz band to a 70 Hz band is
 meaningless unless you divide by width or express each as a fraction of total.
@@ -690,8 +699,10 @@ The name is by analogy with physics (∫V²dt across a 1 Ω resistor). There is 
 resistor and the units are not joules — it is a shape measure borrowing the
 algebra.
 
-Ties to the frequency domain: energy/duration == power(x) == Σ band_power over
-the whole spectrum. If those ever disagree, a scaling factor is wrong.
+Ties to the frequency domain: energy/duration == power(x), and with
+`decomp_freq(x, fs; window = :rect, detrend = false)` this also equals
+Σ band_power over the whole spectrum (Parseval). Under the default Hann window
+the spectral sum is about 1.5× higher — see `band_power` for why.
 """
 function energy(x::AbstractVector{<:Real}, fs::Real)
     fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))
