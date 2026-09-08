@@ -854,6 +854,7 @@ windowed_line_length(x::AbstractVector{<:Real}, fs::Real;
 # optimisation here — it is what makes coherence DEFINED. With one segment the
 # numerator and denominator of coherence are algebraically equal and the answer
 # is 1.0 at every frequency regardless of the data.
+
 function _segment_ffts(x::AbstractVector{<:Real}, fs::Real, win::Real,
                        overlap::Real, window::Symbol)
     nwin = round(Int, win * fs)
@@ -901,6 +902,7 @@ electrodes is the expected null result rather than a finding.
 function coherence(x::AbstractVector{<:Real}, y::AbstractVector{<:Real},
                    fs::Real; win::Real = 1.0, overlap::Real = 0.5,
                    window::Symbol = :hann)
+                   length(x) == length(y) || throw(DimensionMismatch("signals differ in length"))
     f, X = _segment_ffts(x, fs, win, overlap, window)
     _, Y = _segment_ffts(y, fs, win, overlap, window)
     size(X, 2) >= 4 || throw(ArgumentError(
