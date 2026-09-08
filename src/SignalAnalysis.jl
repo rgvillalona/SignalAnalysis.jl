@@ -965,59 +965,5 @@ function weighted_phase_lag_index(x::AbstractVector{<:Real},
     # 0/0 where there is no imaginary component at all: report 0, not NaN.
     return f, [d > 0 ? n / d : 0.0 for (n, d) in zip(num, den)]
 end
- 
- 
-# =============================================================================
-# STEP 2 — add this export line to the module (anywhere near the others)
-# =============================================================================
-#
-# export cross_spectrum, coherence, imag_coherency, phase_lag_index,
-#        weighted_phase_lag_index
- 
- 
-# =============================================================================
-# STEP 3 — restart the REPL, reload, then paste this into it
-# =============================================================================
-#
-# using Pkg
-# Pkg.activate(raw"C:\Users\RudyG\OneDrive\Projects\Packages & Libraries\SignalAnalysis")
-# using SignalAnalysis, Random
-#
-# rng = MersenneTwister(42)
-# fs2 = 250.0; dur = 30.0
-# n2 = round(Int, dur*fs2); t2 = (0:n2-1)./fs2
-#
-# # CASE A — ONE generator, two electrodes, opposite polarity, ZERO lag.
-# #          This is the stationary-dipole situation. No propagation exists.
-# src = 4.0 .* sin.(2π*3 .* t2)
-# a1 =  1.0 .* src .+ 1.2 .* randn(rng, n2)
-# a2 = -0.6 .* src .+ 1.2 .* randn(rng, n2)
-#
-# # CASE B — same rhythm with a genuine 25 ms propagation delay.
-# lag = 0.025
-# b1 = 4.0 .* sin.(2π*3 .* t2)          .+ 1.2 .* randn(rng, n2)
-# b2 = 4.0 .* sin.(2π*3 .* (t2 .- lag)) .+ 1.2 .* randn(rng, n2)
-#
-# function conn(u, v, fs)
-#     f, C   = coherence(u, v, fs; win=2.0, overlap=0.5)
-#     _, ic  = imag_coherency(u, v, fs; win=2.0, overlap=0.5)
-#     _, pli = phase_lag_index(u, v, fs; win=2.0, overlap=0.5)
-#     _, wp  = weighted_phase_lag_index(u, v, fs; win=2.0, overlap=0.5)
-#     k = argmin(abs.(f .- 3.0))
-#     (coh=C[k], ic=abs(ic[k]), pli=pli[k], wpli=wp[k])
-# end
-#
-# mA = conn(a1, a2, fs2)   # zero lag
-# mB = conn(b1, b2, fs2)   # 25 ms lag
-#
-# println(rpad("measure",16), rpad("zero lag",14), "25 ms lag")
-# for k in (:coh, :ic, :pli, :wpli)
-#     println(rpad(string(k),16), rpad(round(getfield(mA,k),digits=4),14),
-#             round(getfield(mB,k),digits=4))
-# end
-#
-# EXPECTED: coh high in BOTH columns — it cannot tell them apart.
-#           ic / pli / wpli near 0 in the zero-lag column, high in the lagged one.
- 
 
 end # module SignalAnalysis
