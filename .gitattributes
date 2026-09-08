@@ -1,0 +1,4 @@
+* text=auto
+*.jl text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
