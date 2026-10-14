@@ -2,12 +2,16 @@ module SignalAnalysis
 
 using FFTW
 using Statistics: mean
+using DSP: digitalfilter, filtfilt, Bandpass, Lowpass, Highpass, Butterworth,
+           iirnotch
 
 export PolarSpectrum, resolution, nyquist, nearest_bin
 
 export get_window, get_freq, decomp_freq, to_polar, to_complex, reconstruct,
        isolate_freq, find_peaks, band_power, EEG_BANDS
        
+export bandpass, lowpass, highpass, notch
+
 export derivative, energy, power, rms, rectified_area, line_length,
        windowed_energy, windowed_line_length
 
@@ -420,7 +424,7 @@ CAVEAT ON THE FILTER FORM. Zeroing bins is a brick wall: infinitely steep, which
 sounds ideal and is not. A rectangular edge in frequency is a sinc in time, so
 transients acquire ringing that oscillates BEFORE the event causing it. On an
 EEG trace that looks exactly like a rhythmic precursor to a spike and is entirely
-an artefact. Use a designed zero-phase filter for anything published.
+an artefact. Use `bandpass` for anything you will measure or publish.
 
 Note `window` defaults to :rect here — a taper before an invertible transform
 corrupts the reconstructed waveform.
@@ -514,6 +518,124 @@ band_power(ps::PolarSpectrum, band::Symbol) = band_power(ps, _band_limits(band).
 # With a rectangular window mean(w) == √mean(w²) == 1, so :amplitude scaling is
 # already power-correct and scale == 1/n. Anything else means a taper was used.
 _is_rect_scaled(ps::PolarSpectrum) = isapprox(ps.scale * ps.n, 1.0; rtol = 1e-9)
+
+# =============================================================================
+# FILTERS
+#
+# Designed IIR filters applied forward and backward. These are what you use on
+# data you will MEASURE; `isolate_freq` on a raw signal is for looking only.
+# =============================================================================
+
+function _check_cutoff(fs::Real, f::Real, name::AbstractString)
+    fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))
+    0 < f < fs / 2 || throw(ArgumentError(
+        "$name must lie strictly inside (0, fs/2) = (0, $(fs / 2)) Hz, got $f"))
+end
+
+function _check_order(order::Integer)
+    order >= 1 || throw(ArgumentError("filter order must be ≥ 1, got $order"))
+end
+
+"""
+    bandpass(x, fs, lo, hi; order = 4)
+    lowpass(x, fs, cutoff; order = 4)
+    highpass(x, fs, cutoff; order = 4)
+
+Zero-phase Butterworth filter. Returns a new Float64 vector; `x` is untouched.
+
+WHY ZERO-PHASE. Any causal filter delays each frequency by a different amount,
+so a spike comes out smeared and SHIFTED — by several samples at 256 Hz, which
+is enough to make two channels' onsets disagree about which fired first. Running
+the filter forward and then backward over the whole epoch cancels the phase
+shift exactly: what goes in at sample j comes out centred on sample j. The price
+is that the filter becomes non-causal (it sees the future), so this is an
+offline tool. For a real-time detector you accept the delay and compensate.
+
+WHY BUTTERWORTH. Maximally flat passband — no ripple to modulate the amplitude
+of the rhythm you are measuring — and a monotonic roll-off, so nothing in the
+stopband is accidentally emphasised. The trade is a gentler transition than
+Chebyshev or elliptic designs of the same order, which for EEG is the right
+trade: a slightly leaky 40 Hz edge costs nothing, 1 dB of passband ripple at
+10 Hz does.
+
+ORDER. `order` is the Butterworth order per pass; two passes square the
+magnitude response, so the effective roll-off is that of order 2·`order`
+(48 dB/octave for the default). Higher orders are steeper but ring longer and
+are less numerically stable at very low cutoffs. 4 is the usual compromise.
+
+EDGES. The data is extended by reflection before filtering, so the first and
+last few cycles of the LOWEST passband frequency are unreliable. With a 0.5 Hz
+high-pass that is the first and last ~2–6 s. Either discard them or filter a
+longer record than you need and trim afterwards.
+
+TYPICAL EEG USE.
+    y = bandpass(x, fs, 0.5, 40.0)        # clinical band
+    y = notch(y, fs, 60.0)                # only if 60 Hz is inside the passband
+
+For a sinusoid inside the passband the output amplitude equals the input
+amplitude to within the passband flatness; for one in the stopband it is
+attenuated by at least the stopband depth at that frequency.
+"""
+function bandpass(x::AbstractVector{<:Real}, fs::Real, lo::Real, hi::Real;
+                  order::Integer = 4)
+    _check_cutoff(fs, lo, "lower cutoff")
+    _check_cutoff(fs, hi, "upper cutoff")
+    lo < hi || throw(ArgumentError("lo ($lo) must be below hi ($hi)"))
+    _check_order(order)
+    f = digitalfilter(Bandpass(lo, hi), Butterworth(order); fs = fs)
+    return filtfilt(f, float.(collect(x)))
+end
+
+function lowpass(x::AbstractVector{<:Real}, fs::Real, cutoff::Real;
+                 order::Integer = 4)
+    _check_cutoff(fs, cutoff, "cutoff")
+    _check_order(order)
+    f = digitalfilter(Lowpass(cutoff), Butterworth(order); fs = fs)
+    return filtfilt(f, float.(collect(x)))
+end
+
+function highpass(x::AbstractVector{<:Real}, fs::Real, cutoff::Real;
+                  order::Integer = 4)
+    _check_cutoff(fs, cutoff, "cutoff")
+    _check_order(order)
+    f = digitalfilter(Highpass(cutoff), Butterworth(order); fs = fs)
+    return filtfilt(f, float.(collect(x)))
+end
+
+# lowpass and highpass share bandpass's docstring.
+@doc (@doc bandpass) lowpass
+@doc (@doc bandpass) highpass
+
+"""
+    notch(x, fs, f0; bw = 1.0)
+
+Zero-phase IIR notch at `f0` Hz with −3 dB bandwidth `bw` Hz. For mains hum:
+60 Hz in the Americas, 50 Hz nearly everywhere else.
+
+WHEN YOU NEED IT. Only when `f0` sits inside your passband. A 0.5–40 Hz
+bandpass already attenuates 60 Hz by more than 40 dB, so notching after it
+buys nothing. If you work up to 70 Hz for gamma, you need the notch — and
+usually one at the second harmonic as well (`notch(y, fs, 120.0)`), which is
+only possible if fs > 240 Hz.
+
+WHY NARROW. A notch removes everything in its band, including any neural
+activity that happens to be there. 1 Hz wide takes out 59.5–60.5 Hz and
+nothing else. Widen it only if the hum visibly drifts, which on a stable
+mains supply it does not.
+
+WHY NOT JUST ZERO THE BIN. Mains hum is not stationary over a 30 s epoch — its
+amplitude wanders with whatever else is on the circuit — so its energy spreads
+across several bins and zeroing one leaves most of it. A time-domain notch
+tracks the hum sample by sample.
+"""
+function notch(x::AbstractVector{<:Real}, fs::Real, f0::Real; bw::Real = 1.0)
+    _check_cutoff(fs, f0, "notch frequency")
+    bw > 0 || throw(ArgumentError("bandwidth must be positive, got $bw"))
+    f0 - bw / 2 > 0 || throw(ArgumentError(
+        "notch band [$(f0 - bw/2), $(f0 + bw/2)] Hz extends below 0 Hz"))
+    f = iirnotch(f0, bw; fs = fs)
+    return filtfilt(f, float.(collect(x)))
+end
 
 # =============================================================================
 # PEAK FINDING

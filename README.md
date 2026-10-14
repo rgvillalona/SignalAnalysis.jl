@@ -11,6 +11,8 @@ docstrings that explain the physics behind each number.
   frequency axis in Hz) with amplitude-correct scaling for the chosen window.
   `band_power`, `isolate_freq`, and `find_peaks` (with prominence and sub-bin
   interpolation) work on it directly in Hz.
+- **Filters** — zero-phase Butterworth `bandpass`, `lowpass`, `highpass`, and a
+  mains `notch`, via DSP.jl. These are what you use before measuring.
 - **Time domain** — `energy`, `power`, `rms`, `rectified_area`, `line_length`,
   `derivative`, and sliding-window versions for seizure-onset detection.
 - **Connectivity** — `coherence`, `imag_coherency`, `phase_lag_index`,
@@ -34,6 +36,7 @@ fs = 256.0
 t  = (0:4fs-1) ./ fs
 x  = 10 .* sin.(2π .* 3 .* t) .+ 2 .* sin.(2π .* 10 .* t)   # µV
 
+x  = bandpass(x, fs, 0.5, 40.0)         # zero-phase, 4th-order Butterworth
 ps = decomp_freq(x, fs)                 # Hann window, mean removed
 pk = find_peaks(ps; prominence = 1.0, interpolate = true)
 pk.freqs                                # ≈ [3.0, 10.0]
@@ -53,7 +56,7 @@ guesses units.
 ## Notes
 
 - `isolate_freq` on a raw signal is a brick-wall FFT filter. Fine for looking,
-  not for publishing; use a designed zero-phase filter for that.
+  not for publishing; use `bandpass` for that.
 - Two spectrum scalings: `:amplitude` (default) reads tone heights correctly,
   `:power` makes Σ band power == time-domain power. `band_power` refuses an
   amplitude-scaled Hann spectrum rather than return a number 1.5× too high.
