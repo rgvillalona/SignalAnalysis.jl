@@ -1,6 +1,6 @@
 name = "SignalAnalysis"
 uuid = "8def6fdc-5806-4023-8eca-296dded409fc"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Rudy Villalona"]
 
 [deps]
