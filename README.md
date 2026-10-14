@@ -22,7 +22,7 @@ Not yet registered. From the Julia REPL:
 
 ```julia
 using Pkg
-Pkg.add(url = "https://github.com/Rudithieus/SignalAnalysis.jl")
+Pkg.add(url = "https://github.com/rgvillalona/SignalAnalysis.jl")
 ```
 
 ## Example
@@ -58,4 +58,5 @@ guesses units.
 
 ## License
 
-MIT — see `LICENSE`.
+GPL-3.0 — see `LICENSE`. Copyleft: anyone who distributes a modified version
+must publish their changes under the same terms.
