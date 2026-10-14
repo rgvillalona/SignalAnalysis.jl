@@ -636,31 +636,35 @@ For a sinusoid inside the passband the output amplitude equals the input
 amplitude to within the passband flatness; for one in the stopband it is
 attenuated by at least the stopband depth at that frequency.
 """
-function bandpass(x::AbstractVector{<:Real}, fs::Real, lo::Real, hi::Real;
-                  order::Integer = 4)
+function _design_bandpass(fs::Real, lo::Real, hi::Real, order::Integer)
     _check_cutoff(fs, lo, "lower cutoff")
     _check_cutoff(fs, hi, "upper cutoff")
     lo < hi || throw(ArgumentError("lo ($lo) must be below hi ($hi)"))
     _check_order(order)
-    f = digitalfilter(Bandpass(lo, hi), Butterworth(order); fs = fs)
-    return filtfilt(f, float.(collect(x)))
+    return digitalfilter(Bandpass(lo, hi), Butterworth(order); fs = fs)
 end
 
-function lowpass(x::AbstractVector{<:Real}, fs::Real, cutoff::Real;
-                 order::Integer = 4)
+function _design_lowpass(fs::Real, cutoff::Real, order::Integer)
     _check_cutoff(fs, cutoff, "cutoff")
     _check_order(order)
-    f = digitalfilter(Lowpass(cutoff), Butterworth(order); fs = fs)
-    return filtfilt(f, float.(collect(x)))
+    return digitalfilter(Lowpass(cutoff), Butterworth(order); fs = fs)
 end
 
-function highpass(x::AbstractVector{<:Real}, fs::Real, cutoff::Real;
-                  order::Integer = 4)
+function _design_highpass(fs::Real, cutoff::Real, order::Integer)
     _check_cutoff(fs, cutoff, "cutoff")
     _check_order(order)
-    f = digitalfilter(Highpass(cutoff), Butterworth(order); fs = fs)
-    return filtfilt(f, float.(collect(x)))
+    return digitalfilter(Highpass(cutoff), Butterworth(order); fs = fs)
 end
+
+bandpass(x::AbstractVector{<:Real}, fs::Real, lo::Real, hi::Real;
+         order::Integer = 4) =
+    filtfilt(_design_bandpass(fs, lo, hi, order), float.(collect(x)))
+
+lowpass(x::AbstractVector{<:Real}, fs::Real, cutoff::Real; order::Integer = 4) =
+    filtfilt(_design_lowpass(fs, cutoff, order), float.(collect(x)))
+
+highpass(x::AbstractVector{<:Real}, fs::Real, cutoff::Real; order::Integer = 4) =
+    filtfilt(_design_highpass(fs, cutoff, order), float.(collect(x)))
 
 # lowpass and highpass share bandpass's docstring.
 @doc (@doc bandpass) lowpass
@@ -688,14 +692,16 @@ amplitude wanders with whatever else is on the circuit — so its energy spreads
 across several bins and zeroing one leaves most of it. A time-domain notch
 tracks the hum sample by sample.
 """
-function notch(x::AbstractVector{<:Real}, fs::Real, f0::Real; bw::Real = 1.0)
+function _design_notch(fs::Real, f0::Real, bw::Real)
     _check_cutoff(fs, f0, "notch frequency")
     bw > 0 || throw(ArgumentError("bandwidth must be positive, got $bw"))
     f0 - bw / 2 > 0 || throw(ArgumentError(
         "notch band [$(f0 - bw/2), $(f0 + bw/2)] Hz extends below 0 Hz"))
-    f = iirnotch(f0, bw; fs = fs)
-    return filtfilt(f, float.(collect(x)))
+    return iirnotch(f0, bw; fs = fs)
 end
+
+notch(x::AbstractVector{<:Real}, fs::Real, f0::Real; bw::Real = 1.0) =
+    filtfilt(_design_notch(fs, f0, bw), float.(collect(x)))
 
 # =============================================================================
 # PEAK FINDING
@@ -1178,6 +1184,100 @@ function band_power(ps::PowerSpectrum, lo::Real, hi::Real)
 end
 
 band_power(ps::PowerSpectrum, band::Symbol) = band_power(ps, _band_limits(band)...)
+
+# =============================================================================
+# MULTI-CHANNEL
+#
+# CONVENTION: a recording is a samples × channels matrix — each COLUMN is one
+# channel, time runs down the rows. Julia stores matrices column-major, so a
+# channel is then contiguous in memory, `eachcol(X)` walks channels without
+# copying, and DSP.jl's filters already run down columns. If your data arrive
+# as channels × samples (the layout MNE and most papers draw), `permutedims(X)`
+# converts once, up front.
+#
+# Every method below applies the single-channel function to each column and
+# collects the results: a Vector for scalar measures (one value per channel), a
+# Matrix of the same shape for filtered signals, a Vector of spectra for
+# spectral ones, and windows × channels for the sliding measures. Nothing here
+# is computed ACROSS channels — that is what the connectivity functions do.
+# =============================================================================
+
+const ChannelMatrix = AbstractMatrix{<:Real}
+
+function _check_channels(X::ChannelMatrix)
+    size(X, 1) >= 2 || throw(ArgumentError(
+        "expected samples × channels with ≥ 2 samples; got size $(size(X)). " *
+        "If this is channels × samples, pass permutedims(X)."))
+    size(X, 2) >= 1 || throw(ArgumentError("matrix has no channels (columns)"))
+end
+
+_percolumn(f, X::ChannelMatrix) = [f(view(X, :, c)) for c in axes(X, 2)]
+
+# Filters: filtfilt treats each column as a signal, so no loop is needed.
+bandpass(X::ChannelMatrix, fs::Real, lo::Real, hi::Real; order::Integer = 4) =
+    (_check_channels(X); filtfilt(_design_bandpass(fs, lo, hi, order), float.(X)))
+lowpass(X::ChannelMatrix, fs::Real, cutoff::Real; order::Integer = 4) =
+    (_check_channels(X); filtfilt(_design_lowpass(fs, cutoff, order), float.(X)))
+highpass(X::ChannelMatrix, fs::Real, cutoff::Real; order::Integer = 4) =
+    (_check_channels(X); filtfilt(_design_highpass(fs, cutoff, order), float.(X)))
+notch(X::ChannelMatrix, fs::Real, f0::Real; bw::Real = 1.0) =
+    (_check_channels(X); filtfilt(_design_notch(fs, f0, bw), float.(X)))
+
+# Spectra: one PolarSpectrum / PowerSpectrum per channel.
+function decomp_freq(X::ChannelMatrix, fs::Real; kwargs...)
+    _check_channels(X)
+    return _percolumn(x -> decomp_freq(x, fs; kwargs...), X)
+end
+
+function welch(X::ChannelMatrix, fs::Real; kwargs...)
+    _check_channels(X)
+    return _percolumn(x -> welch(x, fs; kwargs...), X)
+end
+
+# Band power over a vector of spectra, as produced by the two methods above.
+band_power(spectra::AbstractVector{<:AbstractSpectrum}, lo::Real, hi::Real) =
+    [band_power(ps, lo, hi) for ps in spectra]
+band_power(spectra::AbstractVector{<:AbstractSpectrum}, band::Symbol) =
+    band_power(spectra, _band_limits(band)...)
+
+# Brick-wall band isolation, per channel.
+function isolate_freq(X::ChannelMatrix, fs::Real, lo::Real, hi::Real; kwargs...)
+    _check_channels(X)
+    return reduce(hcat, _percolumn(x -> isolate_freq(x, fs, lo, hi; kwargs...), X))
+end
+isolate_freq(X::ChannelMatrix, fs::Real, band::Symbol; kwargs...) =
+    isolate_freq(X, fs, _band_limits(band)...; kwargs...)
+
+# Scalar time-domain measures: one value per channel.
+energy(X::ChannelMatrix, fs::Real) = (_check_channels(X); _percolumn(x -> energy(x, fs), X))
+power(X::ChannelMatrix) = (_check_channels(X); _percolumn(power, X))
+rms(X::ChannelMatrix) = (_check_channels(X); _percolumn(rms, X))
+rectified_area(X::ChannelMatrix, fs::Real) =
+    (_check_channels(X); _percolumn(x -> rectified_area(x, fs), X))
+line_length(X::ChannelMatrix; normalize::Bool = false) =
+    (_check_channels(X); _percolumn(x -> line_length(x; normalize = normalize), X))
+
+function derivative(X::ChannelMatrix, fs::Real; order::Integer = 1)
+    _check_channels(X)
+    return reduce(hcat, _percolumn(x -> derivative(x, fs; order = order), X))
+end
+
+# Sliding measures: window centres are identical for every channel, so return
+# them once, with values as windows × channels.
+function windowed_energy(X::ChannelMatrix, fs::Real; win::Real = 1.0,
+                         overlap::Real = 0.5)
+    _check_channels(X)
+    per = _percolumn(x -> windowed_energy(x, fs; win = win, overlap = overlap), X)
+    return per[1][1], reduce(hcat, (v for (_, v) in per))
+end
+
+function windowed_line_length(X::ChannelMatrix, fs::Real; win::Real = 1.0,
+                              overlap::Real = 0.5, normalize::Bool = false)
+    _check_channels(X)
+    per = _percolumn(x -> windowed_line_length(x, fs; win = win, overlap = overlap,
+                                               normalize = normalize), X)
+    return per[1][1], reduce(hcat, (v for (_, v) in per))
+end
 
 # =============================================================================
 # CONNECTIVITY

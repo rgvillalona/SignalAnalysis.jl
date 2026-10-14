@@ -18,6 +18,9 @@ docstrings that explain the physics behind each number.
   `derivative`, and sliding-window versions for seizure-onset detection.
 - **Connectivity** — `coherence`, `imag_coherency`, `phase_lag_index`,
   `weighted_phase_lag_index` from Welch-style segment averaging.
+- **Multi-channel** — every measure above also accepts a samples × channels
+  matrix and returns one result per channel, so a 23-channel record needs no
+  loop.
 
 ## Install
 
@@ -47,6 +50,9 @@ pp = decomp_freq(x, fs; scaling = :power)
 band_power(pp, :alpha)                  # µV², 8–13 Hz, from one FFT
 w  = welch(x, fs; win = 2.0)            # averaged PSD, µV²/Hz
 band_power(w, :alpha)                   # same quantity, far less noisy
+
+X = randn(256 * 30, 23)                 # 30 s, 23 channels: samples × channels
+band_power(welch(X, fs), :alpha)        # 23-element Vector, one per channel
 line_length(x)                          # µV
 ```
 
