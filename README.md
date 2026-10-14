@@ -73,6 +73,20 @@ guesses units.
   amplitude-scaled Hann spectrum rather than return a number 1.5× too high.
   See the `decomp_freq` docstring.
 
+## Tests
+
+```julia
+using Pkg
+Pkg.activate("path/to/SignalAnalysis")
+Pkg.test()
+```
+
+The suite checks the identities the docstrings claim: on-bin tone amplitude and
+phase, Parseval under `:power` scaling, exact reconstruction, zero-phase
+filtering, 4A line length per cycle, Welch against the periodogram, and that
+the lag-sensitive connectivity measures separate a zero-lag source from a
+propagated one where coherence cannot.
+
 ## License
 
 GPL-3.0 — see `LICENSE`. Copyleft: anyone who distributes a modified version
