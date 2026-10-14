@@ -39,7 +39,11 @@ you cannot pair a magnitude vector with the wrong frequency axis.
 
 `n` is the ORIGINAL sample count, not the bin count — it cannot be recovered from
 the bin count alone (n=8 and n=9 both give 5 bins) and `irfft` needs it.
-`scale` records the amplitude normalisation so the transform can be inverted.
+`scale` records the normalisation applied to |X| so the transform can be
+inverted. `scaling` records WHICH normalisation (:amplitude, :power or :none),
+because the right way to read `magnitude` depends on it — see `decomp_freq`.
+`single_sided` records whether bins 2:end were doubled, so `to_complex` knows
+whether to halve them again.
 """
 struct PolarSpectrum{T<:Real}
     freq::Vector{T}
@@ -48,17 +52,23 @@ struct PolarSpectrum{T<:Real}
     fs::T
     n::Int
     scale::T
+    scaling::Symbol
+    single_sided::Bool
 
     function PolarSpectrum(freq::Vector{T}, magnitude::Vector{T},
-                           phase::Vector{T}, fs::T, n::Integer,
-                           scale::T) where {T<:Real}
+                           phase::Vector{T}, fs::T, n::Integer, scale::T;
+                           scaling::Symbol = :amplitude,
+                           single_sided::Bool = true) where {T<:Real}
         length(freq) == length(magnitude) == length(phase) ||
             throw(DimensionMismatch("freq, magnitude, phase must match in length"))
         fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))
         n > 0 || throw(ArgumentError("sample count must be positive, got $n"))
         length(freq) == n ÷ 2 + 1 || throw(DimensionMismatch(
             "an $n-sample real signal gives $(n ÷ 2 + 1) bins, got $(length(freq))"))
-        return new{T}(freq, magnitude, phase, fs, Int(n), scale)
+        scaling in (:amplitude, :power, :none) || throw(ArgumentError(
+            "scaling must be :amplitude, :power or :none, got $scaling"))
+        return new{T}(freq, magnitude, phase, fs, Int(n), scale, scaling,
+                      single_sided)
     end
 end
 
@@ -103,6 +113,7 @@ function Base.show(io::IO, ::MIME"text/plain", ps::PolarSpectrum{T}) where {T}
     println(io, "  samples    : ", ps.n)
     println(io, "  fs         : ", ps.fs, " Hz")
     println(io, "  resolution : ", round(resolution(ps), digits = 4), " Hz")
+    println(io, "  scaling    : ", ps.scaling)
     if !isempty(ps.magnitude)
         k = argmax(ps.magnitude)
         println(io, "  peak       : ", round(ps.freq[k], digits = 3), " Hz")
@@ -229,7 +240,7 @@ get_freq(x::AbstractVector, fs::Real) = get_freq(length(x), fs)
 # =============================================================================
 
 """
-    to_polar(X, fs, n; scale = 1.0, single_sided = true)
+    to_polar(X, fs, n; scale = 1.0, single_sided = true, scaling = :amplitude)
 
 Convert a complex half-spectrum (from `rfft`) to a `PolarSpectrum`.
 
@@ -245,7 +256,8 @@ half, so the rest is doubled. DC and Nyquist are exempt — they have no distinc
 negative partner (−0 = 0, and at fs/2 both images land on the same bin).
 """
 function to_polar(X::AbstractVector{<:Complex}, fs::Real, n::Integer;
-                  scale::Real = 1.0, single_sided::Bool = true)
+                  scale::Real = 1.0, single_sided::Bool = true,
+                  scaling::Symbol = :amplitude)
     nbins = length(X)
     nbins == n ÷ 2 + 1 || throw(DimensionMismatch(
         "expected $(n ÷ 2 + 1) bins for $n samples, got $nbins"))
@@ -267,18 +279,20 @@ function to_polar(X::AbstractVector{<:Complex}, fs::Real, n::Integer;
 
     T = promote_type(eltype(mag), eltype(phase), eltype(freq), typeof(float(fs)))
     return PolarSpectrum(Vector{T}(freq), Vector{T}(mag), Vector{T}(phase),
-                         T(fs), n, T(scale))
+                         T(fs), n, T(scale);
+                         scaling = scaling, single_sided = single_sided)
 end
 
 """
     to_complex(ps)
 
-Rebuild the raw complex half-spectrum, undoing the doubling and the scaling.
+Rebuild the raw complex half-spectrum, undoing the doubling (if it was applied)
+and the scaling.
 """
 function to_complex(ps::PolarSpectrum)
     mag = copy(ps.magnitude)
     nb = length(mag)
-    if nb > 1
+    if ps.single_sided && nb > 1
         for k in 2:nb
             mag[k] /= 2
         end
@@ -304,7 +318,7 @@ reconstruct(ps::PolarSpectrum) = irfft(to_complex(ps), ps.n)
 # =============================================================================
 
 """
-    decomp_freq(x, fs; window = :hann, detrend = true, scaled = true)
+    decomp_freq(x, fs; window = :hann, detrend = true, scaling = :amplitude)
 
 Decompose a real signal into frequency components. Main entry point.
 
@@ -328,11 +342,27 @@ scale = 1/(n·mean(w)), and magnitude[k₀] == A exactly.
 Meanwhile angle(X[k₀]) == φ, so phase is referenced to a COSINE at the first
 sample of the epoch. Shifting the epoch changes every phase; phase is meaningful
 only relative to a fixed origin, or as a difference between channels sharing one.
+
+AMPLITUDE VERSUS POWER SCALING. The derivation above is for a TONE. It divides
+by mean(w) because a taper shrinks a sinusoid's peak by exactly that factor.
+But power goes as the SQUARE of the window, and mean(w²) ≠ mean(w)²: for Hann
+they are 0.375 and 0.25, so amplitude scaling overstates broadband power by
+1.5×. No single scale factor is right for both quantities.
+
+  :amplitude  (default) magnitude[k₀] == A for a tone on bin k₀. Read peaks.
+  :power      scale = 1/(n·√mean(w²)), so Σ magnitude²/2 == power(x) for any
+              window (exactly for :rect, in expectation otherwise). Use this
+              whenever you will call `band_power` or compare to time-domain
+              power. Peak heights of tones will read √(mean(w²))/mean(w) high —
+              1.22× for Hann — which is why it is not the default.
+  :none       raw rfft output, no doubling. For inverting.
+
+`PolarSpectrum.scaling` remembers the choice so downstream code can check it.
 """
 function decomp_freq(x::AbstractVector{<:Real}, fs::Real;
                      window::Union{Symbol,AbstractVector{<:Real}} = :hann,
                      detrend::Bool = true,
-                     scaled::Bool = true)
+                     scaling::Symbol = :amplitude)
     n = length(x)
     n >= 2 || throw(ArgumentError("need at least 2 samples, got $n"))
     fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))
@@ -347,12 +377,24 @@ function decomp_freq(x::AbstractVector{<:Real}, fs::Real;
     length(w) == n || throw(DimensionMismatch(
         "window has $(length(w)) coefficients but signal has $n samples"))
 
-    cg = coherent_gain(w)
-    cg > 0 || throw(ArgumentError("window has zero mean; cannot correct gain"))
+    if scaling === :amplitude
+        cg = coherent_gain(w)
+        cg > 0 || throw(ArgumentError("window has zero mean; cannot correct gain"))
+        scale = 1 / (n * cg)
+    elseif scaling === :power
+        pg = sqrt(mean(abs2, w))
+        pg > 0 || throw(ArgumentError("window is all zeros"))
+        scale = 1 / (n * pg)
+    elseif scaling === :none
+        scale = 1.0
+    else
+        throw(ArgumentError(
+            "scaling must be :amplitude, :power or :none, got $scaling"))
+    end
 
     X = rfft(xf .* w)
-    scale = scaled ? 1 / (n * cg) : 1.0
-    return to_polar(X, fs, n; scale = scale, single_sided = scaled)
+    return to_polar(X, fs, n; scale = scale, single_sided = scaling !== :none,
+                    scaling = scaling)
 end
 
 # =============================================================================
@@ -433,21 +475,27 @@ WHY A²/2 AND NOT A². A sinusoid of amplitude A has mean square A²/2, because 
 average of cos² over a cycle is 1/2. DC and Nyquist are excluded from the halving
 because they are not oscillations: a constant of size A has mean square A².
 
-PARSEVAL, AND WHEN IT HOLDS. With `window = :rect` and `detrend = false`,
-summing A_k²/2 across every bin reproduces `power(x)` exactly. That is the
-strongest single check on the package's scaling — but it holds ONLY for those
-settings. The default Hann window is scaled by coherent gain, which is correct
-for the AMPLITUDE of a tone but overcounts broadband POWER by
-mean(w²)/mean(w)² = 1.5, and spreads each tone across three bins whose A²/2
-values sum to 1.5× the true power. With `detrend = true` the DC bin is zero
-regardless of the signal's offset. So do not expect Σ band_power == power(x)
-under the defaults; use `:rect` when you need that identity, and treat Hann
-band powers as comparable to each other rather than to time-domain power.
+PARSEVAL, AND WHEN IT HOLDS. Summing A_k²/2 across every bin reproduces
+`power(x)` — the strongest single check on the package's scaling — but only if
+the spectrum was made with `scaling = :power`. The default `:amplitude` scaling
+is right for reading tone heights and overstates broadband power by
+mean(w²)/mean(w)², which is 1.5 for Hann. For `:rect` the two scalings coincide
+and the identity is exact; for other windows it holds in expectation. With
+`detrend = true` the DC bin is zero regardless of the signal's offset, so
+compare against the power of the detrended signal.
+
+This function throws if given an `:amplitude` spectrum from a non-rectangular
+window, because the number it would return is wrong in a way that is easy to
+miss. Build the spectrum with `decomp_freq(x, fs; scaling = :power)`.
 
 Band power scales with bandwidth, so comparing a 0.5 Hz band to a 70 Hz band is
 meaningless unless you divide by width or express each as a fraction of total.
 """
 function band_power(ps::PolarSpectrum, lo::Real, hi::Real)
+    ps.scaling === :power || (ps.scaling === :amplitude && _is_rect_scaled(ps)) ||
+        throw(ArgumentError(
+            "band_power needs a :power-scaled spectrum (got :$(ps.scaling)); " *
+            "rebuild with decomp_freq(x, fs; scaling = :power)"))
     total = 0.0
     last_bin = length(ps)
     has_nyquist = iseven(ps.n)
@@ -462,6 +510,10 @@ function band_power(ps::PolarSpectrum, lo::Real, hi::Real)
 end
 
 band_power(ps::PolarSpectrum, band::Symbol) = band_power(ps, _band_limits(band)...)
+
+# With a rectangular window mean(w) == √mean(w²) == 1, so :amplitude scaling is
+# already power-correct and scale == 1/n. Anything else means a taper was used.
+_is_rect_scaled(ps::PolarSpectrum) = isapprox(ps.scale * ps.n, 1.0; rtol = 1e-9)
 
 # =============================================================================
 # PEAK FINDING
@@ -699,10 +751,9 @@ The name is by analogy with physics (∫V²dt across a 1 Ω resistor). There is 
 resistor and the units are not joules — it is a shape measure borrowing the
 algebra.
 
-Ties to the frequency domain: energy/duration == power(x), and with
-`decomp_freq(x, fs; window = :rect, detrend = false)` this also equals
-Σ band_power over the whole spectrum (Parseval). Under the default Hann window
-the spectral sum is about 1.5× higher — see `band_power` for why.
+Ties to the frequency domain: energy/duration == power(x) == Σ band_power over
+the whole spectrum, provided the spectrum was built with `scaling = :power` and
+`detrend = false` (Parseval). If those disagree, a scaling factor is wrong.
 """
 function energy(x::AbstractVector{<:Real}, fs::Real)
     fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))

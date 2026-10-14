@@ -39,7 +39,8 @@ pk = find_peaks(ps; prominence = 1.0, interpolate = true)
 pk.freqs                                # ≈ [3.0, 10.0]
 pk.heights                              # ≈ [10.0, 2.0]
 
-band_power(ps, :alpha)                  # µV², 8–13 Hz
+pp = decomp_freq(x, fs; scaling = :power)
+band_power(pp, :alpha)                  # µV², 8–13 Hz
 line_length(x)                          # µV
 ```
 
@@ -53,8 +54,10 @@ guesses units.
 
 - `isolate_freq` on a raw signal is a brick-wall FFT filter. Fine for looking,
   not for publishing; use a designed zero-phase filter for that.
-- Parseval (Σ band power == time-domain power) holds exactly only with
-  `window = :rect, detrend = false`. See the `band_power` docstring.
+- Two spectrum scalings: `:amplitude` (default) reads tone heights correctly,
+  `:power` makes Σ band power == time-domain power. `band_power` refuses an
+  amplitude-scaled Hann spectrum rather than return a number 1.5× too high.
+  See the `decomp_freq` docstring.
 
 ## License
 
