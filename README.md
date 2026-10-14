@@ -10,7 +10,8 @@ docstrings that explain the physics behind each number.
 - **Spectrum** — `decomp_freq` returns a `PolarSpectrum` (magnitude, phase,
   frequency axis in Hz) with amplitude-correct scaling for the chosen window.
   `band_power`, `isolate_freq`, and `find_peaks` (with prominence and sub-bin
-  interpolation) work on it directly in Hz.
+  interpolation) work on it directly in Hz. `welch` gives an averaged power
+  spectral density in µV²/Hz, the right input for band power on real records.
 - **Filters** — zero-phase Butterworth `bandpass`, `lowpass`, `highpass`, and a
   mains `notch`, via DSP.jl. These are what you use before measuring.
 - **Time domain** — `energy`, `power`, `rms`, `rectified_area`, `line_length`,
@@ -43,7 +44,9 @@ pk.freqs                                # ≈ [3.0, 10.0]
 pk.heights                              # ≈ [10.0, 2.0]
 
 pp = decomp_freq(x, fs; scaling = :power)
-band_power(pp, :alpha)                  # µV², 8–13 Hz
+band_power(pp, :alpha)                  # µV², 8–13 Hz, from one FFT
+w  = welch(x, fs; win = 2.0)            # averaged PSD, µV²/Hz
+band_power(w, :alpha)                   # same quantity, far less noisy
 line_length(x)                          # µV
 ```
 

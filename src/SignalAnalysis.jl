@@ -5,9 +5,9 @@ using Statistics: mean
 using DSP: digitalfilter, filtfilt, Bandpass, Lowpass, Highpass, Butterworth,
            iirnotch
 
-export PolarSpectrum, resolution, nyquist, nearest_bin
+export PolarSpectrum, PowerSpectrum, resolution, nyquist, nearest_bin
 
-export get_window, get_freq, decomp_freq, to_polar, to_complex, reconstruct,
+export get_window, get_freq, decomp_freq, welch, to_polar, to_complex, reconstruct,
        isolate_freq, find_peaks, band_power, EEG_BANDS
        
 export bandpass, lowpass, highpass, notch
@@ -76,9 +76,49 @@ struct PolarSpectrum{T<:Real}
     end
 end
 
-Base.length(ps::PolarSpectrum) = length(ps.freq)
+"""
+    PowerSpectrum{T<:Real}
+
+One-sided power spectral DENSITY from `welch`, in squared voltage per Hz
+(µV²/Hz). `freq` and `psd` are the axis and values. `n` is the SEGMENT length in
+samples, which sets the resolution exactly as in `PolarSpectrum`; `nseg` is how
+many segments were averaged, which sets the variance.
+
+Density, not power: the value at a bin is power per Hz, so it is comparable
+across different segment lengths, and integrating it (Σ psd·Δf) gives power in
+µV². `band_power` does that integration.
+"""
+struct PowerSpectrum{T<:Real}
+    freq::Vector{T}
+    psd::Vector{T}
+    fs::T
+    n::Int
+    nseg::Int
+
+    function PowerSpectrum(freq::Vector{T}, psd::Vector{T}, fs::T, n::Integer,
+                           nseg::Integer) where {T<:Real}
+        length(freq) == length(psd) ||
+            throw(DimensionMismatch("freq and psd must match in length"))
+        fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))
+        n > 0 || throw(ArgumentError("segment length must be positive, got $n"))
+        nseg > 0 || throw(ArgumentError("segment count must be positive, got $nseg"))
+        length(freq) == n ÷ 2 + 1 || throw(DimensionMismatch(
+            "an $n-sample segment gives $(n ÷ 2 + 1) bins, got $(length(freq))"))
+        return new{T}(freq, psd, fs, Int(n), Int(nseg))
+    end
+end
+
+# Both spectrum types carry the same kind of frequency axis, so the axis
+# helpers below accept either.
+const AbstractSpectrum = Union{PolarSpectrum, PowerSpectrum}
+
+_spectrum_values(ps::PolarSpectrum) = ps.magnitude
+_spectrum_values(ps::PowerSpectrum) = ps.psd
+
+Base.length(ps::AbstractSpectrum) = length(ps.freq)
 Base.getindex(ps::PolarSpectrum, k::Integer) =
     (freq = ps.freq[k], magnitude = ps.magnitude[k], phase = ps.phase[k])
+Base.getindex(ps::PowerSpectrum, k::Integer) = (freq = ps.freq[k], psd = ps.psd[k])
 
 """
     resolution(ps)
@@ -88,8 +128,11 @@ Bin spacing Δf = fs/n = 1/T, in Hz.
 Set entirely by epoch DURATION, not sampling rate. A 2-second epoch gives 0.5 Hz
 whether sampled at 256 Hz or 2 kHz — only a longer epoch helps, and only if the
 signal is stationary across it. To separate 3 Hz from 2.75 Hz you need ≥4 s.
+
+For a `PowerSpectrum` the relevant duration is the SEGMENT, not the record: a
+30 s record analysed in 2 s segments has 0.5 Hz resolution, not 0.033 Hz.
 """
-resolution(ps::PolarSpectrum) = ps.fs / ps.n
+resolution(ps::AbstractSpectrum) = ps.fs / ps.n
 
 """
     nyquist(ps)
@@ -98,14 +141,14 @@ fs/2. Content above this is not lost, it is ALIASED — folded down onto lower
 frequencies where it is indistinguishable from real content. The anti-aliasing
 filter belongs in the amplifier and cannot be fixed here.
 """
-nyquist(ps::PolarSpectrum) = ps.fs / 2
+nyquist(ps::AbstractSpectrum) = ps.fs / 2
 
 """
     nearest_bin(ps, f)
 
 Index of the bin centred closest to `f` Hz. Bins sit at k·fs/n.
 """
-function nearest_bin(ps::PolarSpectrum, f::Real)
+function nearest_bin(ps::AbstractSpectrum, f::Real)
     0 <= f <= nyquist(ps) || throw(ArgumentError(
         "$f Hz is outside [0, $(nyquist(ps))] Hz"))
     return clamp(round(Int, f * ps.n / ps.fs) + 1, 1, length(ps))
@@ -120,6 +163,19 @@ function Base.show(io::IO, ::MIME"text/plain", ps::PolarSpectrum{T}) where {T}
     println(io, "  scaling    : ", ps.scaling)
     if !isempty(ps.magnitude)
         k = argmax(ps.magnitude)
+        println(io, "  peak       : ", round(ps.freq[k], digits = 3), " Hz")
+    end
+end
+
+function Base.show(io::IO, ::MIME"text/plain", ps::PowerSpectrum{T}) where {T}
+    println(io, "PowerSpectrum{$T}")
+    println(io, "  bins       : ", length(ps))
+    println(io, "  segment    : ", ps.n, " samples")
+    println(io, "  segments   : ", ps.nseg)
+    println(io, "  fs         : ", ps.fs, " Hz")
+    println(io, "  resolution : ", round(resolution(ps), digits = 4), " Hz")
+    if !isempty(ps.psd)
+        k = argmax(ps.psd)
         println(io, "  peak       : ", round(ps.freq[k], digits = 3), " Hz")
     end
 end
@@ -492,6 +548,10 @@ This function throws if given an `:amplitude` spectrum from a non-rectangular
 window, because the number it would return is wrong in a way that is easy to
 miss. Build the spectrum with `decomp_freq(x, fs; scaling = :power)`.
 
+For a real recording longer than a few seconds, use `welch` and call
+`band_power` on the result instead: a single periodogram is far too noisy to
+read a band power from. See the `welch` docstring for why.
+
 Band power scales with bandwidth, so comparing a 0.5 Hz band to a 70 Hz band is
 meaningless unless you divide by width or express each as a fraction of total.
 """
@@ -722,11 +782,11 @@ function _find_peaks_impl(v, height, distance, prominence, interpolate)
             offsets = offsets)
 end
 
-function find_peaks(ps::PolarSpectrum;
+function find_peaks(ps::AbstractSpectrum;
                     distance::Union{Nothing,Real} = nothing, kwargs...)
     df = resolution(ps)
     dist_bins = distance === nothing ? nothing : distance / df   # Hz -> bins
-    r = find_peaks(ps.magnitude; distance = dist_bins, kwargs...)
+    r = find_peaks(_spectrum_values(ps); distance = dist_bins, kwargs...)
     freqs = [ps.freq[i] for i in r.indices] .+ r.offsets .* df
     return (indices = r.indices, freqs = freqs, heights = r.heights,
             prominences = r.prominences)
@@ -1032,6 +1092,94 @@ windowed_line_length(x::AbstractVector{<:Real}, fs::Real;
     _sliding(seg -> line_length(seg; normalize = normalize), x, fs, win, overlap)
 
 # =============================================================================
+# WELCH POWER SPECTRAL DENSITY
+# =============================================================================
+
+"""
+    welch(x, fs; win = 2.0, overlap = 0.5, window = :hann, detrend = true)
+
+Averaged one-sided power spectral density in µV²/Hz, as a `PowerSpectrum`.
+
+WHY ONE FFT IS NOT ENOUGH. The periodogram of a noisy signal is itself noisy:
+each bin's estimate has a standard deviation about equal to its mean, and a
+LONGER epoch does not help. More samples buy more bins, not better bins. On a
+30 s EEG record the raw spectrum is a forest of spikes from which no band power
+can be read reliably.
+
+Welch's fix: cut the record into segments, transform each, average the squared
+magnitudes. Averaging M roughly independent estimates cuts the scatter by about
+√M. The price is resolution — each segment is shorter than the record, so
+Δf = 1/win rather than 1/T. For EEG band power that trade is always right:
+0.5 Hz from 2 s segments separates the clinical bands comfortably, and a 30 s
+record then gives 29 segments at 50% overlap, a √29 ≈ 5× reduction in scatter.
+
+THE NORMALISATION. Per segment |X[k]|² / (fs · Σw²), averaged across segments,
+then doubled for k ≥ 2 (except Nyquist) because the negative frequencies are
+folded in. Dividing by Σw² rather than n·mean(w)² is what makes this a POWER
+estimate under a taper — the same reasoning as `scaling = :power` in
+`decomp_freq`. Dividing by fs turns power per bin into power per Hz. Together
+they give Σ psd·Δf == power(x) for any window, up to segment-mean removal.
+
+WHY DENSITY. Power per bin depends on how wide the bins are, so two spectra with
+different `win` cannot be compared bin for bin. Power per Hz can. It also makes
+`band_power` an integral, Σ psd·Δf, which does not move when you change the
+resolution — only its noisiness does.
+
+CHOICES. `window = :hann` with `overlap = 0.5` is the standard pairing: Hann
+tapers the segment edges to nothing, and 50% overlap puts those edges under the
+middle of the neighbouring segment, so no sample is systematically
+under-weighted. `detrend = true` removes each segment's mean so slow drift does
+not leak into delta; set it false only for the Parseval check.
+
+With `win` equal to the whole record and `window = :rect` this reduces to the
+single periodogram with power scaling.
+"""
+function welch(x::AbstractVector{<:Real}, fs::Real; win::Real = 2.0,
+               overlap::Real = 0.5, window::Symbol = :hann,
+               detrend::Bool = true)
+    f, X = _segment_ffts(x, fs, win, overlap, window; detrend = detrend)
+    nwin = round(Int, win * fs)
+    w = get_window(window, nwin)
+    nseg = size(X, 2)
+
+    psd = vec(mean(abs2.(X), dims = 2)) ./ (fs * sum(abs2, w))
+
+    nb = length(psd)
+    if nb > 1
+        for k in 2:nb
+            psd[k] *= 2
+        end
+        if iseven(nwin)
+            psd[nb] /= 2
+        end
+    end
+
+    T = promote_type(eltype(psd), eltype(f), typeof(float(fs)))
+    return PowerSpectrum(Vector{T}(f), Vector{T}(psd), T(fs), nwin, nseg)
+end
+
+"""
+    band_power(ps::PowerSpectrum, lo, hi)
+    band_power(ps::PowerSpectrum, band::Symbol)
+
+Σ psd·Δf over the bins in [lo, hi]: integrated power in µV². Because `psd` is a
+density this is the same quantity `band_power` returns for a `:power`-scaled
+`PolarSpectrum`, only far less noisy. This is the band power to report.
+"""
+function band_power(ps::PowerSpectrum, lo::Real, hi::Real)
+    lo <= hi || throw(ArgumentError("lo ($lo) must not exceed hi ($hi)"))
+    df = resolution(ps)
+    total = 0.0
+    for k in eachindex(ps.freq)
+        lo <= ps.freq[k] <= hi || continue
+        total += ps.psd[k] * df
+    end
+    return total
+end
+
+band_power(ps::PowerSpectrum, band::Symbol) = band_power(ps, _band_limits(band)...)
+
+# =============================================================================
 # CONNECTIVITY
 # =============================================================================
 # Split x into overlapping windows and transform each. Segmenting is not an
@@ -1040,7 +1188,7 @@ windowed_line_length(x::AbstractVector{<:Real}, fs::Real;
 # is 1.0 at every frequency regardless of the data.
 
 function _segment_ffts(x::AbstractVector{<:Real}, fs::Real, win::Real,
-                       overlap::Real, window::Symbol)
+                       overlap::Real, window::Symbol; detrend::Bool = true)
     nwin = round(Int, win * fs)
     nwin >= 4 || throw(ArgumentError("window of $win s at $fs Hz is only $nwin samples"))
     nwin <= length(x) || throw(ArgumentError("window longer than signal"))
@@ -1053,7 +1201,7 @@ function _segment_ffts(x::AbstractVector{<:Real}, fs::Real, win::Real,
     X = Matrix{ComplexF64}(undef, nwin ÷ 2 + 1, length(starts))
     for (m, s) in enumerate(starts)
         seg = float.(collect(view(x, s:(s + nwin - 1))))
-        seg .-= mean(seg)
+        detrend && (seg .-= mean(seg))
         X[:, m] = rfft(seg .* w)
     end
     return get_freq(nwin, fs), X
