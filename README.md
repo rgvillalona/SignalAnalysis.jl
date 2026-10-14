@@ -64,6 +64,8 @@ guesses units.
 
 ## Notes
 
+- `detrend = :linear` on `decomp_freq` and `welch`, or `detrend(x)` on its own,
+  removes the electrode-drift ramp that mean removal leaves behind.
 - `isolate_freq` on a raw signal is a brick-wall FFT filter. Fine for looking,
   not for publishing; use `bandpass` for that.
 - Two spectrum scalings: `:amplitude` (default) reads tone heights correctly,

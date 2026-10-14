@@ -7,7 +7,8 @@ using DSP: digitalfilter, filtfilt, Bandpass, Lowpass, Highpass, Butterworth,
 
 export PolarSpectrum, PowerSpectrum, resolution, nyquist, nearest_bin
 
-export get_window, get_freq, decomp_freq, welch, to_polar, to_complex, reconstruct,
+export get_window, get_freq, decomp_freq, welch, detrend, to_polar, to_complex,
+       reconstruct,
        isolate_freq, find_peaks, band_power, EEG_BANDS
        
 export bandpass, lowpass, highpass, notch
@@ -119,6 +120,8 @@ Base.length(ps::AbstractSpectrum) = length(ps.freq)
 Base.getindex(ps::PolarSpectrum, k::Integer) =
     (freq = ps.freq[k], magnitude = ps.magnitude[k], phase = ps.phase[k])
 Base.getindex(ps::PowerSpectrum, k::Integer) = (freq = ps.freq[k], psd = ps.psd[k])
+Base.iterate(ps::AbstractSpectrum, k::Integer = 1) =
+    k > length(ps) ? nothing : (ps[k], k + 1)
 
 """
     resolution(ps)
@@ -374,11 +377,69 @@ spectrum alone.
 reconstruct(ps::PolarSpectrum) = irfft(to_complex(ps), ps.n)
 
 # =============================================================================
+# DETRENDING
+# =============================================================================
+
+"""
+    detrend(x; method = :linear)
+
+Return a copy of `x` with a constant (`:mean`) or least-squares straight line
+(`:linear`) removed; `:none` returns a Float64 copy unchanged. On a
+samples × channels matrix each column is detrended on its own.
+
+WHY A LINE AND NOT JUST THE MEAN. Electrode drift over an epoch looks like a
+ramp: the half-cell potential wanders as gel dries or skin sweats. A ramp has a
+non-zero mean AND a slope. Subtracting the mean removes the first and leaves
+the second, and a ramp's spectrum falls off as 1/f — most of it lands in the
+bins below 1 Hz, next to the delta activity you are trying to measure. Fitting
+and subtracting a line removes both.
+
+WHY NOT A HIGHER-ORDER POLYNOMIAL. On a 2–4 s epoch nothing distinguishes a
+quadratic drift from a genuine sub-0.5 Hz oscillation; a polynomial fit would
+remove either. Linear is the highest order that is unambiguous. For long
+records, where drift bends over tens of seconds, use `highpass(x, fs, 0.5)`
+instead — a filter tracks a wandering baseline, a single line cannot.
+
+THE COST. A least-squares fit removes a little of every component that is not
+orthogonal to the fitted shape over the epoch. A line is nearly orthogonal to
+any whole number of cycles, so sinusoids completing ≥ 1 cycle in the epoch are
+barely touched; a component slower than 1/T is partly removed, which is the
+point.
+
+The line is fitted about a centred time axis, so the intercept is exactly the
+mean and `:linear` reduces to `:mean` when the slope is zero. The `detrend`
+keyword of `decomp_freq`, `welch` and `isolate_freq` takes the same symbols,
+and still accepts `true` (= `:mean`) and `false` (= `:none`).
+"""
+detrend(x::AbstractVector{<:Real}; method::Symbol = :linear) =
+    _detrend!(Float64.(x), method)
+
+_detrend_method(m::Bool) = m ? :mean : :none
+_detrend_method(m::Symbol) = m
+
+# In-place worker on a fresh float copy. Accepts the Bool spellings so the
+# keyword arguments that predate :linear keep working unchanged.
+function _detrend!(xf::AbstractVector{<:AbstractFloat}, method)
+    m = _detrend_method(method)
+    m === :none && return xf
+    m in (:mean, :linear) || throw(ArgumentError(
+        "detrend must be :none, :mean, :linear, true or false; got $method"))
+    xf .-= mean(xf)
+    if m === :linear && length(xf) >= 2
+        n = length(xf)
+        t = (0:(n - 1)) .- (n - 1) / 2        # centred: Σt == 0, so the slope
+        slope = sum(t .* xf) / sum(abs2, t)   # is independent of the mean
+        xf .-= slope .* t
+    end
+    return xf
+end
+
+# =============================================================================
 # DECOMPOSITION
 # =============================================================================
 
 """
-    decomp_freq(x, fs; window = :hann, detrend = true, scaling = :amplitude)
+    decomp_freq(x, fs; window = :hann, detrend = :mean, scaling = :amplitude)
 
 Decompose a real signal into frequency components. Main entry point.
 
@@ -387,8 +448,10 @@ adds a slow ramp. Neither is neural, and both are enormous compared to the
 signal — millivolts of offset against tens of microvolts of activity is routine.
 Left in, the offset dumps into bin 1 and the window's side lobes spread a
 fraction of that mountain across the low-frequency bins, contaminating exactly
-the delta range where 3 Hz activity lives. (Mean removal does NOT fix a linear
-trend — fit and subtract a line first if drift is substantial.)
+the delta range where 3 Hz activity lives. Mean removal does NOT fix a ramp,
+though — a ramp's spectrum falls as 1/f and lands squarely in delta — so for
+drifting epochs pass `detrend = :linear`, which also removes a least-squares
+line. See `detrend`. `true` means `:mean`, `false` means `:none`.
 
 THE SCALING, DERIVED. For x[j] = A·cos(2πf₀j/fs + φ) with f₀ on bin k₀:
 
@@ -421,17 +484,14 @@ they are 0.375 and 0.25, so amplitude scaling overstates broadband power by
 """
 function decomp_freq(x::AbstractVector{<:Real}, fs::Real;
                      window::Union{Symbol,AbstractVector{<:Real}} = :hann,
-                     detrend::Bool = true,
+                     detrend::Union{Bool,Symbol} = :mean,
                      scaling::Symbol = :amplitude)
     n = length(x)
     n >= 2 || throw(ArgumentError("need at least 2 samples, got $n"))
     fs > 0 || throw(ArgumentError("sampling rate must be positive, got $fs"))
 
     # Float64 regardless of input — integer ADC counts would truncate at detrend.
-    xf = float.(collect(x))
-    if detrend
-        xf .-= mean(xf)
-    end
+    xf = _detrend!(Float64.(x), detrend)
 
     w = window isa Symbol ? get_window(window, n) : float.(collect(window))
     length(w) == n || throw(DimensionMismatch(
@@ -504,10 +564,9 @@ isolate_freq(ps::PolarSpectrum, band::Symbol) =
 
 function isolate_freq(x::AbstractVector{<:Real}, fs::Real, lo::Real, hi::Real;
                       window::Union{Symbol,AbstractVector{<:Real}} = :rect,
-                      detrend::Bool = true)
+                      detrend::Union{Bool,Symbol} = :mean)
     n = length(x)
-    xf = float.(collect(x))
-    detrend && (xf .-= mean(xf))
+    xf = _detrend!(Float64.(x), detrend)
 
     w = window isa Symbol ? get_window(window, n) : float.(collect(window))
     X = rfft(xf .* w)
@@ -1012,10 +1071,14 @@ CLOSED FORM. For A·sin(2πf₀t), over one period
     ∫|2πf₀A·cos(2πf₀t)|dt = 2πf₀A · 2/(πf₀) = 4A
 so n complete periods give exactly 4An, INDEPENDENT of both f₀ and fs.
 
-THE DISCRETISATION BIAS. The sum measures chords; the integral measures arc. A
-chord is always shorter, so discrete line length systematically UNDERESTIMATES,
-and the shortfall grows as sampling coarsens: ~0.45% low at 40 samples/cycle,
-~5.0% low at 10. This is a bias, not noise — it does not average away.
+THE DISCRETISATION BIAS. Σ|Δx| is the total variation of the SAMPLES, and it
+falls short of the continuous signal's only where a sample misses an extremum:
+the trace turns round between two samples and the tip of that excursion is
+never seen. For a sinusoid with N samples per period the shortfall is between 0
+(samples land on the peaks) and 1 − cos(π/N) (peaks fall midway between
+samples): at worst 4.9% at N = 10, 0.31% at N = 40. On real EEG, where peaks
+fall anywhere, expect about half the worst case. It is a bias, not noise — it
+does not average away.
 
 Practical consequence: line length is only comparable across recordings at the
 SAME sampling rate. Never compare a 256 Hz clinical value to a 1 kHz research
@@ -1102,7 +1165,7 @@ windowed_line_length(x::AbstractVector{<:Real}, fs::Real;
 # =============================================================================
 
 """
-    welch(x, fs; win = 2.0, overlap = 0.5, window = :hann, detrend = true)
+    welch(x, fs; win = 2.0, overlap = 0.5, window = :hann, detrend = :mean)
 
 Averaged one-sided power spectral density in µV²/Hz, as a `PowerSpectrum`.
 
@@ -1134,15 +1197,16 @@ resolution — only its noisiness does.
 CHOICES. `window = :hann` with `overlap = 0.5` is the standard pairing: Hann
 tapers the segment edges to nothing, and 50% overlap puts those edges under the
 middle of the neighbouring segment, so no sample is systematically
-under-weighted. `detrend = true` removes each segment's mean so slow drift does
-not leak into delta; set it false only for the Parseval check.
+under-weighted. `detrend = :mean` removes each segment's mean so slow drift does
+not leak into delta; `:linear` also removes a per-segment ramp (see `detrend`);
+`:none` is for the Parseval check only.
 
 With `win` equal to the whole record and `window = :rect` this reduces to the
 single periodogram with power scaling.
 """
 function welch(x::AbstractVector{<:Real}, fs::Real; win::Real = 2.0,
                overlap::Real = 0.5, window::Symbol = :hann,
-               detrend::Bool = true)
+               detrend::Union{Bool,Symbol} = :mean)
     f, X = _segment_ffts(x, fs, win, overlap, window; detrend = detrend)
     nwin = round(Int, win * fs)
     w = get_window(window, nwin)
@@ -1212,6 +1276,9 @@ function _check_channels(X::ChannelMatrix)
 end
 
 _percolumn(f, X::ChannelMatrix) = [f(view(X, :, c)) for c in axes(X, 2)]
+
+detrend(X::ChannelMatrix; method::Symbol = :linear) =
+    (_check_channels(X); reduce(hcat, _percolumn(x -> detrend(x; method = method), X)))
 
 # Filters: filtfilt treats each column as a signal, so no loop is needed.
 bandpass(X::ChannelMatrix, fs::Real, lo::Real, hi::Real; order::Integer = 4) =
@@ -1288,7 +1355,8 @@ end
 # is 1.0 at every frequency regardless of the data.
 
 function _segment_ffts(x::AbstractVector{<:Real}, fs::Real, win::Real,
-                       overlap::Real, window::Symbol; detrend::Bool = true)
+                       overlap::Real, window::Symbol;
+                       detrend::Union{Bool,Symbol} = :mean)
     nwin = round(Int, win * fs)
     nwin >= 4 || throw(ArgumentError("window of $win s at $fs Hz is only $nwin samples"))
     nwin <= length(x) || throw(ArgumentError("window longer than signal"))
@@ -1300,8 +1368,7 @@ function _segment_ffts(x::AbstractVector{<:Real}, fs::Real, win::Real,
  
     X = Matrix{ComplexF64}(undef, nwin ÷ 2 + 1, length(starts))
     for (m, s) in enumerate(starts)
-        seg = float.(collect(view(x, s:(s + nwin - 1))))
-        detrend && (seg .-= mean(seg))
+        seg = _detrend!(Float64.(view(x, s:(s + nwin - 1))), detrend)
         X[:, m] = rfft(seg .* w)
     end
     return get_freq(nwin, fs), X
